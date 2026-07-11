@@ -2,8 +2,17 @@
  * JoSAA Round Tracker & Analyzer 2026
  * Application Logic with Multi-Category/Gender support, auto-discovery loader
  * PARSER v3 — inline institute/program split (no post-processing needed)
+ *
+ * PERF FIX (v3.1):
+ *   - Debounced input handlers for rank/allotment (was: synchronous on every keystroke).
+ *   - Split render path: rank/allotment changes only re-render advisory + table;
+ *     matching is skipped entirely (matching depends only on prefs/cat/gender).
+ *   - Precompute normalize() / tokenize() on round records at parse time.
+ *   - Cache the (category, gender)-filtered subset of records so matchAllRounds()
+ *     does the filter once per recalc, not once per preference.
+ *   - Debounced localStorage save (was: serialize full prefs on every keystroke).
  */
-console.log('[JoSAA] app.js v3 loaded');
+console.log('[JoSAA] app.js v3.1 loaded');
 
 // Application State
 const state = {
@@ -24,33 +33,38 @@ const state = {
 // the loaded round data (which is tab-separated and authoritative).
 let knownInstitutesCache = null;
 
+// PERF: cache of (category||gender) -> { filtered: records, byNorm: Map }
+// Invalidated when category/gender change OR when round data is reloaded.
+let matchIndexCache = null;
+let matchIndexKey = null;
+
 // UI Elements
 const els = {
   prefPasteInput: document.getElementById('pref-paste-input'),
   prefLoadBtn: document.getElementById('pref-load-btn'),
   prefLoadStatus: document.getElementById('pref-load-status'),
-  
+
   userCategory: document.getElementById('user-category'),
   userGender: document.getElementById('user-gender'),
   userRankInput: document.getElementById('user-rank'),
   userAllotmentInput: document.getElementById('user-allotment'),
-  
+
   tutorialToggle: document.getElementById('tutorial-toggle'),
   tutorialCard: document.querySelector('.tutorial-card'),
-  
+
   advisoryCard: document.getElementById('advisory-card'),
   advisoryBadge: document.getElementById('advisory-badge'),
   advisoryDescription: document.getElementById('advisory-description'),
-  
+
   tableThead: document.getElementById('table-thead'),
   tableBody: document.getElementById('table-body'),
   tableSearch: document.getElementById('table-search'),
   matchStatusFilter: document.getElementById('match-status-filter'),
   tableSummaryText: document.getElementById('table-summary-text'),
-  
+
   resetAppBtn: document.getElementById('reset-app-btn'),
   exportPdfBtn: document.getElementById('export-pdf-btn'),
-  
+
   roundsPills: document.getElementById('rounds-pills'),
   themeToggleBtn: document.getElementById('theme-toggle-btn'),
   themeIcon: document.getElementById('theme-icon')
@@ -80,6 +94,35 @@ function tokenize(str) {
   if (!str) return [];
   return str.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9\s]/g, '')
     .split(/\s+/).filter(t => t.length > 0);
+}
+
+// ---- PERF: debounce helper ----
+// Returns a function that delays invoking `fn` until `wait`ms have elapsed
+// since the last call. Trailing-edge only. The returned function also has a
+// `.flush()` method to force immediate invocation (used on blur).
+function debounce(fn, wait) {
+  let timer = null;
+  function debounced(...args) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn.apply(this, args);
+    }, wait);
+  }
+  debounced.flush = function () {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+      fn.apply(this);
+    }
+  };
+  debounced.cancel = function () {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return debounced;
 }
 
 // ---- Initialization ----
@@ -135,30 +178,49 @@ function setupEventListeners() {
   // Profile Inputs
   els.userCategory.addEventListener('change', (e) => {
     state.userCategory = e.target.value;
+    invalidateMatchIndex();
     saveStateToLocalStorage();
     recalculateAndRender();
   });
 
   els.userGender.addEventListener('change', (e) => {
     state.userGender = e.target.value;
+    invalidateMatchIndex();
     saveStateToLocalStorage();
     recalculateAndRender();
   });
 
-  els.userRankInput.addEventListener('input', (e) => {
-    state.userRank = parseInt(e.target.value) || null;
-    saveStateToLocalStorage();
-    recalculateAndRender();
+  // PERF: rank & allotment changes do NOT affect matching — they only affect
+  // advisory + gap display. So we skip matchAllRounds() entirely on these
+  // events. We also debounce so a rapid sequence of keystrokes only triggers
+  // one re-render.
+  const onRankInput = debounce(() => {
+    state.userRank = parseInt(els.userRankInput.value) || null;
+    schedulePersist();
+    renderAdvisoryAndTable();
+  }, 150);
+  els.userRankInput.addEventListener('input', onRankInput);
+  els.userRankInput.addEventListener('blur', () => {
+    onRankInput.flush();
+    flushPersist();
   });
 
-  els.userAllotmentInput.addEventListener('input', (e) => {
-    state.allottedChoiceNo = parseInt(e.target.value) || null;
-    saveStateToLocalStorage();
-    recalculateAndRender();
+  const onAllotmentInput = debounce(() => {
+    state.allottedChoiceNo = parseInt(els.userAllotmentInput.value) || null;
+    schedulePersist();
+    renderAdvisoryAndTable();
+  }, 150);
+  els.userAllotmentInput.addEventListener('input', onAllotmentInput);
+  els.userAllotmentInput.addEventListener('blur', () => {
+    onAllotmentInput.flush();
+    flushPersist();
   });
 
-  // Table Search and Filter
-  els.tableSearch.addEventListener('input', renderTable);
+  // Table Search and Filter (debounced — renderTable itself is cheap but
+  // typing fast in a long list still causes layout thrash)
+  const onSearchInput = debounce(renderTable, 120);
+  els.tableSearch.addEventListener('input', onSearchInput);
+  els.tableSearch.addEventListener('blur', onSearchInput.flush);
   els.matchStatusFilter.addEventListener('change', renderTable);
 
   // PDF Export
@@ -173,13 +235,13 @@ function setupEventListeners() {
     state.preferenceOrder = [];
     state.userRank = null;
     state.allottedChoiceNo = null;
-    
+
     els.prefPasteInput.value = '';
     els.userRankInput.value = '';
     els.userAllotmentInput.value = '';
     els.prefLoadStatus.textContent = 'No preference list loaded';
     els.prefLoadStatus.className = 'load-status';
-    
+
     recalculateAndRender();
   });
 }
@@ -188,7 +250,7 @@ function setupEventListeners() {
 async function loadRoundData() {
   els.roundsPills.innerHTML = '<span class="round-pill loading">Loading rounds...</span>';
   let loadedCount = 0;
-  
+
   for (let r = 1; r <= 5; r++) {
     try {
       const response = await fetch(`data/josaaRoundData/r${r}.txt`);
@@ -208,9 +270,10 @@ async function loadRoundData() {
       break;
     }
   }
-  
+
   state.loadedRoundsCount = loadedCount;
   knownInstitutesCache = null; // Invalidate cache; will be rebuilt on next refine
+  invalidateMatchIndex();
   updateRoundsDisplay();
 }
 
@@ -219,7 +282,7 @@ function updateRoundsDisplay() {
     els.roundsPills.innerHTML = '<span class="round-pill" style="color:var(--red)">No Data</span>';
     return;
   }
-  
+
   let html = '';
   for (let r = 1; r <= 5; r++) {
     const isLoaded = state.roundsData[r] !== null;
@@ -232,29 +295,40 @@ function updateRoundsDisplay() {
 function parseRawRanksText(text) {
   const lines = text.split('\n');
   const records = [];
-  
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-    
+
     const parts = line.split('\t');
     if (parts.length === 7) {
       const inst = parts[0].trim();
       if (inst === 'Institute' || inst.startsWith('Joint Seat Allocation')) {
         continue; // Skip header/meta lines
       }
-      
+
       const prog = parts[1].trim();
       const quota = parts[2].trim().toUpperCase();
       const seatType = parts[3].trim();
       const gender = parts[4].trim();
       const openRank = parts[5].trim();
       const closeRank = parts[6].trim();
-      
+
+      const instProgStr = inst + ' ' + prog;
+      // PERF: precompute the normalized form and token list ONCE at load time.
+      // Previously these were recomputed inside findMatchesForChoice() for
+      // every preference, every recalc — that was the bulk of the CPU cost.
+      const normInstProg = normalize(instProgStr);
+      const tokens = tokenize(instProgStr);
+      const sigTokens = tokens.filter(t => !commonWords.includes(t));
+
       records.push({
         institute: inst,
         program: prog,
-        instProgStr: inst + ' ' + prog,
+        instProgStr,
+        normInstProg,
+        tokens,
+        sigTokens,
         quota,
         category: seatType,
         gender,
@@ -454,6 +528,7 @@ function parseAndLoadPreferenceOrder(text) {
     const combined = c.institute + ' ' + c.program;
     c.combinedNorm = normalize(combined);
     c.tokens = tokenize(combined);
+    c.sigTokens = c.tokens.filter(t => !commonWords.includes(t));
   });
 
   state.preferenceOrder = parsed.sort((a, b) => a.choiceNo - b.choiceNo);
@@ -506,10 +581,10 @@ function refinePreferenceSplits() {
   if (state.loadedRoundsCount === 0) return;
   if (!knownInstitutesCache) buildKnownInstitutesCache();
   if (knownInstitutesCache.length === 0) return;
-  
+
   // Quick lookup: institutes we already recognize
   const knownInstSet = new Set(knownInstitutesCache.map(k => k.norm));
-  
+
   for (const choice of state.preferenceOrder) {
     // Skip if institute is already a known institute AND program is non-empty
     // — this means the original parse was clean (tab-separated) and we don't
@@ -517,12 +592,12 @@ function refinePreferenceSplits() {
     if (choice.program && choice.institute && knownInstSet.has(normalize(choice.institute))) {
       continue;
     }
-    
+
     const combinedOrig = (choice.institute + ' ' + choice.program).trim();
     if (!combinedOrig) continue;
-    
+
     const cn = normalize(combinedOrig);
-    
+
     // Find the longest known institute whose normalized form is a prefix of
     // the choice's normalized combined text.
     let matched = null;
@@ -532,16 +607,16 @@ function refinePreferenceSplits() {
         break; // knownInstitutesCache is sorted longest-first
       }
     }
-    
+
     if (!matched) continue;
-    
+
     // Locate the institute substring in the original (un-normalized) combined
     // text so we can split there. Match case-insensitively, after collapsing
     // whitespace, to be tolerant of minor formatting differences.
     const instLower = matched.orig.toLowerCase().replace(/\s+/g, ' ').trim();
     const combLower = combinedOrig.toLowerCase().replace(/\s+/g, ' ').trim();
     const idx = combLower.indexOf(instLower);
-    
+
     if (idx === 0) {
       // Institute is at the very start — everything after it is the program
       const progPart = combinedOrig.substring(matched.orig.length).trim();
@@ -555,33 +630,75 @@ function refinePreferenceSplits() {
       // normalization).
       choice.institute = matched.orig;
     }
-    
+
     // Re-normalize so matching and display stay consistent
     const combined = choice.institute + ' ' + choice.program;
     choice.combinedNorm = normalize(combined);
     choice.tokens = tokenize(combined);
+    choice.sigTokens = choice.tokens.filter(t => !commonWords.includes(t));
   }
+}
+
+// ---- PERF: per-(category,gender) match index ----
+// Previously, findMatchesForChoice() called records.filter(r => r.category === X && r.gender === Y)
+// FOR EVERY preference choice. With ~100 prefs, that's 100x redundant filtering.
+// We now build the filtered subset ONCE per recalc and reuse it for every choice.
+function invalidateMatchIndex() {
+  matchIndexCache = null;
+  matchIndexKey = null;
+}
+
+function getMatchIndex() {
+  if (state.loadedRoundsCount === 0) return null;
+  const key = state.userCategory + '||' + state.userGender;
+  if (matchIndexCache && matchIndexKey === key) return matchIndexCache;
+
+  // Build per-round filtered subsets. Each entry is the list of records in
+  // round r matching the current (category, gender).
+  const perRound = [];
+  for (let r = 1; r <= state.loadedRoundsCount; r++) {
+    const records = state.roundsData[r];
+    if (!records) {
+      perRound.push(null);
+      continue;
+    }
+    // PERF: for-loop is meaningfully faster than .filter() here because we
+    // also want to skip records with no usable program string.
+    const filtered = [];
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+      if (rec.category === state.userCategory && rec.gender === state.userGender) {
+        filtered.push(rec);
+      }
+    }
+    perRound.push(filtered);
+  }
+  matchIndexCache = { perRound };
+  matchIndexKey = key;
+  return matchIndexCache;
 }
 
 // ---- Priority Matching Logic ----
 function matchAllRounds() {
   if (state.preferenceOrder.length === 0) return;
-  
+
   const category = state.userCategory;
   const gender = state.userGender;
-  
+  const index = getMatchIndex();
+  if (!index) return;
+
   for (const choice of state.preferenceOrder) {
     // Reset ranks
     for (let r = 1; r <= 5; r++) {
       choice.ranks[r] = null;
     }
-    
+
     // Match each loaded round
     for (let r = 1; r <= state.loadedRoundsCount; r++) {
-      const records = state.roundsData[r];
-      if (!records) continue;
-      
-      const matches = findMatchesForChoice(choice, records, category, gender);
+      const filtered = index.perRound[r - 1];
+      if (!filtered || filtered.length === 0) continue;
+
+      const matches = findMatchesForChoice(choice, filtered);
       if (matches.length > 0) {
         // Sort by quota priority OS > AI > HS
         matches.sort((a, b) => getQuotaPriority(a.quota) - getQuotaPriority(b.quota));
@@ -591,47 +708,63 @@ function matchAllRounds() {
   }
 }
 
-function findMatchesForChoice(choice, records, category, gender) {
-  // Strict filter on category and gender
-  const filtered = records.filter(r => r.category === category && r.gender === gender);
+// PERF: this function previously:
+//   1. Re-filtered `records` by category+gender on every call (now done once
+//      in getMatchIndex()).
+//   2. Recomputed normalize(r.instProgStr) on every record on every call
+//      (now precomputed at parse time as r.normInstProg).
+//   3. Recomputed tokenize(r.instProgStr) on every call (now precomputed as
+//      r.tokens and r.sigTokens).
+function findMatchesForChoice(choice, filtered) {
   const cn = choice.combinedNorm;
   const matches = [];
-  
+
   // 1. Direct normalized string containment
-  for (const r of filtered) {
-    const rn = normalize(r.instProgStr);
+  for (let i = 0; i < filtered.length; i++) {
+    const r = filtered[i];
+    const rn = r.normInstProg;
+    if (!rn) continue;
     if (rn === cn || rn.includes(cn) || cn.includes(rn)) {
       matches.push(r);
     }
   }
-  
+
   if (matches.length > 0) return matches;
-  
-  // 2. Token containment (handles split cells)
-  for (const r of filtered) {
-    const rToks = tokenize(r.instProgStr).filter(t => !commonWords.includes(t));
-    if (rToks.length >= 3 && rToks.every(t => choice.tokens.includes(t))) {
-      matches.push(r);
+
+  // 2. Token containment (handles split cells) — uses precomputed sigTokens
+  const cToks = choice.sigTokens;
+  if (cToks.length >= 3) {
+    for (let i = 0; i < filtered.length; i++) {
+      const r = filtered[i];
+      const rToks = r.sigTokens;
+      if (rToks.length < 3) continue;
+      let allIn = true;
+      for (let j = 0; j < rToks.length; j++) {
+        if (!cToks.includes(rToks[j])) { allIn = false; break; }
+      }
+      if (allIn) matches.push(r);
     }
   }
-  
+
   if (matches.length > 0) return matches;
-  
+
   // 3. Fuzzy Jaccard score fallback
   let best = null, bestScore = 0;
-  const cToks = choice.tokens.filter(t => !commonWords.includes(t));
-  for (const r of filtered) {
-    const rToks = tokenize(r.instProgStr).filter(t => !commonWords.includes(t));
+  for (let i = 0; i < filtered.length; i++) {
+    const r = filtered[i];
+    const rToks = r.sigTokens;
     if (rToks.length < 3) continue;
     let overlap = 0;
-    for (const t of rToks) { if (cToks.includes(t)) overlap++; }
+    for (let j = 0; j < rToks.length; j++) {
+      if (cToks.includes(rToks[j])) overlap++;
+    }
     const score = overlap / Math.max(rToks.length, cToks.length);
     if (score > bestScore && score > 0.7) {
       bestScore = score;
       best = r;
     }
   }
-  
+
   if (best) matches.push(best);
   return matches;
 }
@@ -642,32 +775,32 @@ function updateAdvisory() {
     els.advisoryCard.style.display = 'none';
     return;
   }
-  
+
   const allotted = state.preferenceOrder.find(c => c.choiceNo === state.allottedChoiceNo);
   if (!allotted) {
     showAdvisory('danger', 'ERROR', `Choice #${state.allottedChoiceNo} is not in the preference list.`);
     return;
   }
-  
+
   const latestRound = state.loadedRoundsCount;
   const higher = state.preferenceOrder.filter(c => c.choiceNo < state.allottedChoiceNo);
-  
+
   if (higher.length === 0) {
     showAdvisory('freeze', 'FREEZE', 'You are allotted your #1 preference. No higher choice to float to.');
     return;
   }
-  
+
   let securedCount = 0;
   let nearestChoice = null;
   let nearGap = Infinity;
-  
+
   for (const c of higher) {
     const rVal = c.ranks[latestRound];
     if (!rVal) continue;
-    
+
     const cr = parseInt(rVal.replace('P', ''), 10);
     if (isNaN(cr)) continue;
-    
+
     const gap = cr - state.userRank;
     if (gap >= 0) {
       securedCount++;
@@ -679,7 +812,7 @@ function updateAdvisory() {
       }
     }
   }
-  
+
   if (securedCount > 0) {
     showAdvisory('float', 'FLOAT', `Rank clears ${securedCount} higher choice${securedCount > 1 ? 's' : ''} in R${latestRound}. Highly recommend floating.`);
   } else if (nearestChoice) {
@@ -705,7 +838,7 @@ function showAdvisory(cls, badge, text) {
 function renderTable() {
   const query = (els.tableSearch.value || '').trim().toLowerCase();
   const filter = els.matchStatusFilter.value;
-  
+
   if (state.preferenceOrder.length === 0) {
     els.tableThead.innerHTML = `<tr>
       <th class="text-center" width="55">#</th>
@@ -721,7 +854,7 @@ function renderTable() {
     els.tableSummaryText.textContent = 'No preference order loaded.';
     return;
   }
-  
+
   // Set headers dynamically based on loaded rounds
   let roundHeaders = '';
   for (let r = 1; r <= state.loadedRoundsCount; r++) {
@@ -734,21 +867,21 @@ function renderTable() {
     ${roundHeaders}
     <th class="text-center" width="85">Gap</th>
   </tr>`;
-  
+
   const list = state.preferenceOrder.filter(c => {
     if (query && !c.institute.toLowerCase().includes(query) && !c.program.toLowerCase().includes(query)) return false;
     if (filter === 'matched' && !Object.values(c.ranks).some(r => r)) return false;
     if (filter === 'above' && state.allottedChoiceNo && c.choiceNo >= state.allottedChoiceNo) return false;
     return true;
   });
-  
+
   els.tableSummaryText.textContent = `${list.length} of ${state.preferenceOrder.length} choices shown`;
-  
+
   if (list.length === 0) {
     els.tableBody.innerHTML = `<tr><td colspan="${3 + state.loadedRoundsCount + 1}" class="empty-state">No matching preferences found.</td></tr>`;
     return;
   }
-  
+
   let html = '';
   for (const c of list) {
     let rowClass = '';
@@ -756,7 +889,7 @@ function renderTable() {
       if (c.choiceNo === state.allottedChoiceNo) rowClass = 'allotted-seat';
       else if (c.choiceNo > state.allottedChoiceNo) rowClass = 'lower-preference';
     }
-    
+
     // Render round cells
     let roundCells = '';
     for (let r = 1; r <= state.loadedRoundsCount; r++) {
@@ -765,7 +898,7 @@ function renderTable() {
         ? `<td class="text-center"><span class="rank-val">${val}</span></td>`
         : `<td class="text-center" style="color:var(--text-muted)">—</td>`;
     }
-    
+
     // Calculate gap for latest round
     let gapHtml = '<span class="gap none">—</span>';
     const latestVal = c.ranks[state.loadedRoundsCount];
@@ -786,7 +919,7 @@ function renderTable() {
         }
       }
     }
-    
+
     html += `<tr class="${rowClass}">
       <td class="text-center" style="font-weight:700">${c.choiceNo}</td>
       <td>${c.institute}</td>
@@ -795,13 +928,22 @@ function renderTable() {
       <td class="text-center">${gapHtml}</td>
     </tr>`;
   }
-  
+
   els.tableBody.innerHTML = html;
 }
 
+// ---- Render-path split (PERF) ----
+// Heavy path: preferences, category, or gender changed -> re-run matching.
 function recalculateAndRender() {
   refinePreferenceSplits(); // Fix institute/program split using round data
   matchAllRounds();
+  updateAdvisory();
+  renderTable();
+}
+
+// Light path: only rank or allotment changed -> matching is unaffected,
+// just re-render advisory + table.
+function renderAdvisoryAndTable() {
   updateAdvisory();
   renderTable();
 }
@@ -810,6 +952,13 @@ function recalculateAndRender() {
 // Bump this when the stored preference format changes — old data is discarded
 // so users don't see stale/broken parses from a previous version of the parser.
 const STATE_VERSION = 2;
+
+// PERF: debounced save — typing 5 digits in the rank box used to JSON.stringify
+// the entire preference list (which can be hundreds of KB) 5 times. Now we
+// coalesce rapid changes into a single save 400ms after the last keystroke,
+// and force an immediate save on blur.
+const schedulePersist = debounce(() => saveStateToLocalStorage(), 400);
+function flushPersist() { schedulePersist.flush(); }
 
 function saveStateToLocalStorage() {
   try {
@@ -830,7 +979,7 @@ function loadStateFromLocalStorage() {
   try {
     const raw = localStorage.getItem('josaa_analyzer_state');
     if (!raw) return;
-    
+
     const s = JSON.parse(raw);
     // Discard old state from previous parser versions — they may have the
     // institute/program split wrong, and re-parsing is safer than trusting
@@ -840,18 +989,18 @@ function loadStateFromLocalStorage() {
       localStorage.removeItem('josaa_analyzer_state');
       return;
     }
-    
+
     state.preferenceOrder = s.preferenceOrder || [];
     state.userRank = s.userRank || null;
     state.allottedChoiceNo = s.allottedChoiceNo || null;
     state.userCategory = s.userCategory || 'OBC-NCL';
     state.userGender = s.userGender || 'Gender-Neutral';
-    
+
     // Set UI values
     if (state.preferenceOrder.length > 0) {
       els.prefLoadStatus.textContent = `${state.preferenceOrder.length} choices loaded`;
       els.prefLoadStatus.className = 'load-status success';
-      
+
       // Reconstruct paste field contents
       let text = '';
       for (const c of state.preferenceOrder) {
@@ -859,7 +1008,7 @@ function loadStateFromLocalStorage() {
       }
       els.prefPasteInput.value = text;
     }
-    
+
     els.userCategory.value = state.userCategory;
     els.userGender.value = state.userGender;
     if (state.userRank) els.userRankInput.value = state.userRank;
