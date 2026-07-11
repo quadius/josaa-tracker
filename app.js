@@ -1,7 +1,9 @@
 /**
  * JoSAA Round Tracker & Analyzer 2026
  * Application Logic with Multi-Category/Gender support, auto-discovery loader
+ * PARSER v3 — inline institute/program split (no post-processing needed)
  */
+console.log('[JoSAA] app.js v3 loaded');
 
 // Application State
 const state = {
@@ -10,9 +12,17 @@ const state = {
   allottedChoiceNo: null,
   userCategory: 'OBC-NCL',
   userGender: 'Gender-Neutral',
-  roundsData: { 1: null, 2: null, 3: null, 4: null, 5: null, 6: null },
+  roundsData: { 1: null, 2: null, 3: null, 4: null, 5: null },
   loadedRoundsCount: 0
 };
+
+// Cache of unique known institute names — used to refine the institute/program
+// split when the user pastes "untidy" data (no tabs, no newlines between
+// institute and program).
+// Array of { orig: string, norm: string }, sorted by norm.length DESC so the
+// longest matching prefix wins. Built lazily by refinePreferenceSplits() from
+// the loaded round data (which is tab-separated and authoritative).
+let knownInstitutesCache = null;
 
 // UI Elements
 const els = {
@@ -42,9 +52,12 @@ const els = {
   exportPdfBtn: document.getElementById('export-pdf-btn'),
   
   roundsPills: document.getElementById('rounds-pills'),
-  corsBanner: document.getElementById('cors-banner'),
-  corsBannerClose: document.getElementById('cors-banner-close')
+  themeToggleBtn: document.getElementById('theme-toggle-btn'),
+  themeIcon: document.getElementById('theme-icon')
 };
+
+const moonPath = `<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>`;
+const sunPath = `<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>`;
 
 const commonWords = [
   'and', 'or', 'of', 'in', 'for', 'with', 'under', 'on', 'at',
@@ -73,14 +86,30 @@ function tokenize(str) {
 document.addEventListener('DOMContentLoaded', async () => {
   setupEventListeners();
   loadStateFromLocalStorage();
-  checkProtocol();
+  initializeTheme();
   await loadRoundData();
   recalculateAndRender();
 });
 
-function checkProtocol() {
-  if (window.location.protocol === 'file:') {
-    els.corsBanner.style.display = 'flex';
+function initializeTheme() {
+  const savedTheme = localStorage.getItem('josaa_theme') || 'dark';
+  if (savedTheme === 'light') {
+    document.body.classList.add('light-theme');
+    els.themeIcon.innerHTML = sunPath;
+  } else {
+    document.body.classList.remove('light-theme');
+    els.themeIcon.innerHTML = moonPath;
+  }
+}
+
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light-theme');
+  if (isLight) {
+    els.themeIcon.innerHTML = sunPath;
+    localStorage.setItem('josaa_theme', 'light');
+  } else {
+    els.themeIcon.innerHTML = moonPath;
+    localStorage.setItem('josaa_theme', 'dark');
   }
 }
 
@@ -90,10 +119,8 @@ function setupEventListeners() {
     els.tutorialCard.classList.toggle('collapsed');
   });
 
-  // CORS banner close
-  els.corsBannerClose.addEventListener('click', () => {
-    els.corsBanner.style.display = 'none';
-  });
+  // Theme Toggle
+  els.themeToggleBtn.addEventListener('click', toggleTheme);
 
   // Preference load
   els.prefLoadBtn.addEventListener('click', () => {
@@ -162,7 +189,7 @@ async function loadRoundData() {
   els.roundsPills.innerHTML = '<span class="round-pill loading">Loading rounds...</span>';
   let loadedCount = 0;
   
-  for (let r = 1; r <= 6; r++) {
+  for (let r = 1; r <= 5; r++) {
     try {
       const response = await fetch(`data/josaaRoundData/r${r}.txt`);
       if (!response.ok) {
@@ -183,6 +210,7 @@ async function loadRoundData() {
   }
   
   state.loadedRoundsCount = loadedCount;
+  knownInstitutesCache = null; // Invalidate cache; will be rebuilt on next refine
   updateRoundsDisplay();
 }
 
@@ -193,7 +221,7 @@ function updateRoundsDisplay() {
   }
   
   let html = '';
-  for (let r = 1; r <= 6; r++) {
+  for (let r = 1; r <= 5; r++) {
     const isLoaded = state.roundsData[r] !== null;
     html += `<span class="round-pill ${isLoaded ? 'active' : ''}">R${r}</span>`;
   }
@@ -224,6 +252,8 @@ function parseRawRanksText(text) {
       const closeRank = parts[6].trim();
       
       records.push({
+        institute: inst,
+        program: prog,
         instProgStr: inst + ' ' + prog,
         quota,
         category: seatType,
@@ -237,48 +267,299 @@ function parseRawRanksText(text) {
 }
 
 // ---- Preference Parser ----
+
+// Split a combined "Institute Name Program Name" string into separate fields.
+// Uses round data as ground truth if available; otherwise uses a heuristic
+// based on the fact that JoSAA program names always contain a parenthetical
+// duration like "(4 Years, Bachelor of Technology)".
+function splitInstituteProgram(combined) {
+  combined = combined.replace(/\s+/g, ' ').trim();
+  if (!combined) return { institute: '', program: '' };
+
+  // 1. Try round data: find the longest known institute name that is a prefix.
+  if (state.loadedRoundsCount > 0) {
+    if (!knownInstitutesCache) buildKnownInstitutesCache();
+    if (knownInstitutesCache && knownInstitutesCache.length > 0) {
+      const cn = normalize(combined);
+      for (const k of knownInstitutesCache) {
+        if (k.norm && cn.startsWith(k.norm)) {
+          const instLower = k.orig.toLowerCase().replace(/\s+/g, ' ').trim();
+          const combLower = combined.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (combLower.indexOf(instLower) === 0) {
+            const prog = combined.substring(k.orig.length).trim();
+            if (prog) return { institute: k.orig, program: prog };
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Heuristic fallback: find the program name by looking for the
+  //    parenthetical duration pattern. JoSAA programs always end with something
+  //    like "(4 Years, Bachelor of Technology)" or "(5 Years, B.Tech. + M.Tech./MS (Dual Degree))".
+  //    The program name is the text from the start of the program field to the
+  //    end. We detect it by finding "(N Years," and working backwards to the
+  //    start of the program name.
+  //
+  //    Strategy: institute names don't contain "(N Years," — so we find the
+  //    FIRST "(<digit> Years," in the string. Everything from the start of the
+  //    word before that parenthetical (the program name) to the end is the
+  //    program. Everything before that is the institute.
+  const parenMatch = combined.match(/\(\d+\s+Years,/);
+  if (parenMatch) {
+    const parenIdx = combined.indexOf(parenMatch[0]);
+    // Walk backwards from parenIdx to find the start of the program name.
+    // The program name starts at the word boundary before the parenthetical.
+    let progStart = parenIdx;
+    // Skip whitespace before the parenthetical
+    while (progStart > 0 && combined[progStart - 1] === ' ') progStart--;
+    // Now skip the program name words (they end at the institute boundary)
+    // We need to find where the institute name ends. We do this by looking
+    // for known institute-ending patterns. Most JoSAA institute names end
+    // with a city/location name. We'll use a simpler heuristic: the institute
+    // name is everything up to the LAST word that looks like a location,
+    // and the program name starts after that.
+    //
+    // Actually, simplest reliable approach: find the FIRST known institute
+    // prefix and use its length. If we can't, just split at the word boundary
+    // right before the program name.
+    //
+    // For now, use this: the program name typically starts with a known
+    // keyword like "Computer", "Electrical", "Mechanical", "Civil", "Chemical",
+    // "Aerospace", "Engineering", "Mathematics", "Physics", "Chemistry",
+    // "Data", "Artificial", "Intelligent", "Biotechnology", "Metallurgical",
+    // "Materials", "Industrial", "Instrumentation", "Energy", "Space",
+    // "BS", "B.Tech", "B. Tech".
+    const progKeywords = [
+      'Computer', 'Electrical', 'Mechanical', 'Civil', 'Chemical',
+      'Aerospace', 'Engineering', 'Mathematics', 'Physics', 'Chemistry',
+      'Data', 'Artificial', 'Intelligent', 'Biotechnology', 'Biochemical',
+      'Metallurgical', 'Materials', 'Industrial', 'Instrumentation',
+      'Energy', 'Space', 'BS', 'B.Tech', 'B. Tech', 'Economics',
+      'Computational', 'Electronics', 'Mining', 'Metallurgy',
+      'Production', 'Architecture', 'Planning', 'Polymer', 'Ceramic',
+      'Pharmaceutical', 'Textile', 'Agricultural', 'Dairy', 'Food',
+      'Leather', 'Paint', 'Paper', 'Packaging', 'Ocean', 'Naval',
+      'Metallurgy', 'mining'
+    ];
+    // Find the first occurrence of a program keyword in the string
+    let bestIdx = -1;
+    for (const kw of progKeywords) {
+      const re = new RegExp('\\b' + kw.replace(/\./g, '\\.') + '\\b', 'i');
+      const m = combined.match(re);
+      if (m) {
+        const idx = combined.indexOf(m[0]);
+        if (bestIdx === -1 || idx < bestIdx) bestIdx = idx;
+      }
+    }
+    if (bestIdx > 0 && bestIdx < parenIdx) {
+      return {
+        institute: combined.substring(0, bestIdx).trim(),
+        program: combined.substring(bestIdx).trim()
+      };
+    }
+    // Can't find program keyword — just return the whole thing as institute
+    return { institute: combined, program: '' };
+  }
+
+  // 3. No parenthetical found — can't split, leave everything as institute
+  return { institute: combined, program: '' };
+}
+
 function parseAndLoadPreferenceOrder(text) {
+  // Pre-process: inject newlines before choice-number boundaries
+  // Splits "...Technology) 2 Indian Institute..." on a single line.
+  // IMPORTANT: use [ ]+ (space only) after the digit, NOT \s+, so we don't
+  // break TSV format where the digit is followed by a tab.
+  const instPrefixes = 'Indian|National|International|Birla|Visvesvaraya|Maulana|Malaviya|Atal|Sardar|Jawaharlal|School|Dr\\.';
+  const splitRe = new RegExp('(?<=\\S)\\s+(\\d+)[ ]+(?=' + instPrefixes + ')', 'gi');
+  text = text.replace(splitRe, '\n$1 ');
   const lines = text.split('\n');
   const parsed = [];
-  
+  let currentChoice = null;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-    
-    let parts = line.split('\t');
-    if (parts.length < 3) {
-      parts = line.split(',');
+
+    // Check if the line has tabs and starts with a number (classic TSV format)
+    let tabParts = line.split('\t');
+    if (tabParts.length >= 3 && /^\d+$/.test(tabParts[0].trim())) {
+      if (currentChoice && currentChoice.institute) {
+        parsed.push(currentChoice);
+      }
+      currentChoice = {
+        choiceNo: parseInt(tabParts[0].trim(), 10),
+        institute: tabParts[1].trim(),
+        program: tabParts[2].trim(),
+        combinedNorm: '',
+        tokens: [],
+        ranks: {}
+      };
+      continue;
     }
-    if (parts.length < 3) continue;
-    
-    const choiceNoStr = parts[0].trim();
-    if (!/^\d+$/.test(choiceNoStr)) {
-      continue; // Skip lines that don't start with a number
+
+    // Check if line starts with a number (space-separated or untidy format)
+    const numberMatch = line.match(/^(\d+)(?:\s+(.*))?$/);
+
+    if (numberMatch) {
+      const choiceNo = parseInt(numberMatch[1], 10);
+      const rest = numberMatch[2] ? numberMatch[2].trim() : '';
+
+      if (currentChoice && currentChoice.institute) {
+        parsed.push(currentChoice);
+      }
+
+      // INLINE SPLIT: if rest contains the full "Institute Program" text,
+      // split it now using round data or heuristic.
+      let institute = rest;
+      let program = '';
+      if (rest) {
+        const split = splitInstituteProgram(rest);
+        institute = split.institute;
+        program = split.program;
+      }
+
+      currentChoice = {
+        choiceNo: choiceNo,
+        institute: institute,
+        program: program,
+        combinedNorm: '',
+        tokens: [],
+        ranks: {}
+      };
+    } else {
+      if (currentChoice) {
+        if (!currentChoice.institute) {
+          currentChoice.institute = line;
+        } else {
+          if (currentChoice.program) {
+            currentChoice.program += ' ' + line;
+          } else {
+            currentChoice.program = line;
+          }
+        }
+      }
     }
-    
-    const choiceNo = parseInt(choiceNoStr, 10);
-    const inst = parts[1].trim();
-    const prog = parts[2].trim();
-    
-    const combined = inst + ' ' + prog;
-    parsed.push({
-      choiceNo,
-      institute: inst,
-      program: prog,
-      combinedNorm: normalize(combined),
-      tokens: tokenize(combined),
-      ranks: {}
-    });
   }
-  
+
+  if (currentChoice && currentChoice.institute) {
+    parsed.push(currentChoice);
+  }
+
+  // Post-process normalization & tokenization
+  parsed.forEach(c => {
+    c.institute = c.institute.replace(/\s+/g, ' ').trim();
+    c.program = c.program.replace(/\s+/g, ' ').trim();
+    const combined = c.institute + ' ' + c.program;
+    c.combinedNorm = normalize(combined);
+    c.tokens = tokenize(combined);
+  });
+
   state.preferenceOrder = parsed.sort((a, b) => a.choiceNo - b.choiceNo);
-  
+
+  // Log to console for debugging
+  let emptyCount = 0;
+  for (const c of state.preferenceOrder) {
+    if (!c.program) emptyCount++;
+  }
+  console.log(`[JoSAA] Parsed ${state.preferenceOrder.length} choices, ${emptyCount} empty programs`);
+
   if (state.preferenceOrder.length > 0) {
     els.prefLoadStatus.textContent = `${state.preferenceOrder.length} choices loaded`;
     els.prefLoadStatus.className = 'load-status success';
   } else {
-    els.prefLoadStatus.textContent = 'Failed to parse text';
+    els.prefLoadStatus.innerHTML = '<span style="color:var(--red)">Failed to parse. Refer to the tutorial step-by-step.</span>';
     els.prefLoadStatus.className = 'load-status';
+  }
+}
+
+// ---- Institute / Program Split Refiner ----
+// When the user pastes "untidy" data with no tabs and no newlines between
+// institute and program, parseAndLoadPreferenceOrder() dumps the entire
+// "Institute Program" string into choice.institute and leaves choice.program
+// empty. This function uses the round data files (which are tab-separated and
+// contain the canonical institute/program split) as ground truth to correctly
+// re-split each choice.
+function buildKnownInstitutesCache() {
+  knownInstitutesCache = [];
+  const seen = new Set();
+  for (let r = 1; r <= state.loadedRoundsCount; r++) {
+    const records = state.roundsData[r];
+    if (!records) continue;
+    for (const rec of records) {
+      if (!rec.institute) continue;
+      const norm = normalize(rec.institute);
+      if (!norm || seen.has(norm)) continue;
+      seen.add(norm);
+      knownInstitutesCache.push({ orig: rec.institute, norm: norm });
+    }
+  }
+  // Longest first so the most specific institute wins on prefix match
+  knownInstitutesCache.sort((a, b) => b.norm.length - a.norm.length);
+  console.log(`[JoSAA] Built institutes cache: ${knownInstitutesCache.length} institutes, loadedRoundsCount=${state.loadedRoundsCount}`);
+}
+
+function refinePreferenceSplits() {
+  // Requires round data to be loaded — the institute names in the round data
+  // are the ground truth for splitting institute/program.
+  if (state.loadedRoundsCount === 0) return;
+  if (!knownInstitutesCache) buildKnownInstitutesCache();
+  if (knownInstitutesCache.length === 0) return;
+  
+  // Quick lookup: institutes we already recognize
+  const knownInstSet = new Set(knownInstitutesCache.map(k => k.norm));
+  
+  for (const choice of state.preferenceOrder) {
+    // Skip if institute is already a known institute AND program is non-empty
+    // — this means the original parse was clean (tab-separated) and we don't
+    // need to touch it.
+    if (choice.program && choice.institute && knownInstSet.has(normalize(choice.institute))) {
+      continue;
+    }
+    
+    const combinedOrig = (choice.institute + ' ' + choice.program).trim();
+    if (!combinedOrig) continue;
+    
+    const cn = normalize(combinedOrig);
+    
+    // Find the longest known institute whose normalized form is a prefix of
+    // the choice's normalized combined text.
+    let matched = null;
+    for (const k of knownInstitutesCache) {
+      if (k.norm && cn.startsWith(k.norm)) {
+        matched = k;
+        break; // knownInstitutesCache is sorted longest-first
+      }
+    }
+    
+    if (!matched) continue;
+    
+    // Locate the institute substring in the original (un-normalized) combined
+    // text so we can split there. Match case-insensitively, after collapsing
+    // whitespace, to be tolerant of minor formatting differences.
+    const instLower = matched.orig.toLowerCase().replace(/\s+/g, ' ').trim();
+    const combLower = combinedOrig.toLowerCase().replace(/\s+/g, ' ').trim();
+    const idx = combLower.indexOf(instLower);
+    
+    if (idx === 0) {
+      // Institute is at the very start — everything after it is the program
+      const progPart = combinedOrig.substring(matched.orig.length).trim();
+      choice.institute = matched.orig;
+      if (progPart) {
+        choice.program = progPart;
+      }
+    } else {
+      // Couldn't align by whitespace — fall back to using the canonical
+      // institute name; keep program as-is (matching still works via combined
+      // normalization).
+      choice.institute = matched.orig;
+    }
+    
+    // Re-normalize so matching and display stay consistent
+    const combined = choice.institute + ' ' + choice.program;
+    choice.combinedNorm = normalize(combined);
+    choice.tokens = tokenize(combined);
   }
 }
 
@@ -291,7 +572,7 @@ function matchAllRounds() {
   
   for (const choice of state.preferenceOrder) {
     // Reset ranks
-    for (let r = 1; r <= 6; r++) {
+    for (let r = 1; r <= 5; r++) {
       choice.ranks[r] = null;
     }
     
@@ -519,15 +800,21 @@ function renderTable() {
 }
 
 function recalculateAndRender() {
+  refinePreferenceSplits(); // Fix institute/program split using round data
   matchAllRounds();
   updateAdvisory();
   renderTable();
 }
 
 // ---- State Management ----
+// Bump this when the stored preference format changes — old data is discarded
+// so users don't see stale/broken parses from a previous version of the parser.
+const STATE_VERSION = 2;
+
 function saveStateToLocalStorage() {
   try {
     localStorage.setItem('josaa_analyzer_state', JSON.stringify({
+      version: STATE_VERSION,
       preferenceOrder: state.preferenceOrder,
       userRank: state.userRank,
       allottedChoiceNo: state.allottedChoiceNo,
@@ -545,6 +832,15 @@ function loadStateFromLocalStorage() {
     if (!raw) return;
     
     const s = JSON.parse(raw);
+    // Discard old state from previous parser versions — they may have the
+    // institute/program split wrong, and re-parsing is safer than trusting
+    // stale data.
+    if (!s.version || s.version < STATE_VERSION) {
+      console.warn('Discarding old localStorage data (version mismatch).');
+      localStorage.removeItem('josaa_analyzer_state');
+      return;
+    }
+    
     state.preferenceOrder = s.preferenceOrder || [];
     state.userRank = s.userRank || null;
     state.allottedChoiceNo = s.allottedChoiceNo || null;
