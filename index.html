@@ -1,15 +1,18 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>JoSAA 2026 — Round Tracker & Analyzer</title>
-  <meta name="description" content="Auto-matching JoSAA cutoff rank analyzer with custom category, gender, and preference order mapping.">
+  <meta name="description"
+    content="Auto-matching JoSAA cutoff rank analyzer with custom category, gender, and preference order mapping.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
+
 <body>
   <div class="app-container">
 
@@ -19,7 +22,7 @@
         <h1>JoSAA 2026</h1>
         <span class="header-subtitle">Round Cutoff Tracker & Seat Float Analyzer</span>
       </div>
-      
+
       <!-- Loaded Rounds Indicators -->
       <div class="rounds-indicator" id="rounds-indicator">
         <span class="indicator-label">Rounds Live:</span>
@@ -31,16 +34,27 @@
 
       <div class="header-actions">
         <button id="theme-toggle-btn" class="btn btn-outline" title="Toggle Light/Dark Theme">
-          <svg id="theme-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg id="theme-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
           </svg>
         </button>
         <button id="export-pdf-btn" class="btn btn-outline" title="Export comparison table as PDF">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+            <line x1="16" y1="13" x2="8" y2="13" />
+            <line x1="16" y1="17" x2="8" y2="17" />
+          </svg>
           Export PDF
         </button>
         <button id="reset-app-btn" class="btn btn-outline" title="Reset preferences and settings">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><polyline points="3 3 3 8 8 8"/></svg>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <polyline points="3 3 3 8 8 8" />
+          </svg>
           Reset
         </button>
       </div>
@@ -51,12 +65,13 @@
 
       <!-- Left Column: Controls -->
       <section class="control-panel">
-        
+
         <!-- Preference Order Paste -->
         <div class="input-card">
           <label class="input-label">1. Preference List</label>
-          <p class="input-desc">Paste choice lines from lock confirmation letter or lock page.</p>
-          <textarea id="pref-paste-input" placeholder="e.g.&#10;1  IIT Madras  Computer Science...&#10;2  IIT Bombay  Computer Science..."></textarea>
+          <p class="input-desc">Refer the tutorial guide linked below</p>
+          <textarea id="pref-paste-input"
+            placeholder="e.g.&#10;1  IIT Madras  Computer Science...&#10;2  IIT Bombay  Computer Science..."></textarea>
           <div class="textarea-actions">
             <button id="pref-load-btn" class="btn btn-primary btn-sm">Load Preferences</button>
             <span class="load-status" id="pref-load-status">No preference list loaded</span>
@@ -68,7 +83,7 @@
         <!-- User Settings -->
         <div class="input-card">
           <label class="input-label">2. Candidate Profile</label>
-          
+
           <div class="form-row">
             <div class="form-col">
               <label for="user-category" class="field-label">Seat Category</label>
@@ -85,7 +100,7 @@
                 <option value="ST (PwD)">ST (PwD)</option>
               </select>
             </div>
-            
+
             <div class="form-col">
               <label for="user-gender" class="field-label">Gender Quota</label>
               <select id="user-gender" class="form-select">
@@ -116,8 +131,10 @@
             <span class="toggle-icon" id="tutorial-toggle-icon">▼</span>
           </div>
           <div class="tutorial-body" id="tutorial-body">
-            <p>Click the link below or scan the QR code to view a step-by-step image tutorial showing how to copy your preference list directly from the candidate portal.</p>
-            <a href="https://guidejar.com/guides/97302d35-8e3f-461e-9cb3-7e47d1134d02" target="_blank" class="tutorial-link">
+            <p>Click the link below or scan the QR code to view a step-by-step image tutorial showing how to copy your
+              preference list directly from the candidate portal.</p>
+            <a href="https://guidejar.com/guides/97302d35-8e3f-461e-9cb3-7e47d1134d02" target="_blank"
+              class="tutorial-link">
               Open Tutorial Guide &nearrow;
             </a>
             <div class="qr-box">
@@ -190,6 +207,7 @@
     </footer>
   </div>
 
-  <script src="app.js?v=3"></script>
+  <script src="app.js?v=3.2"></script>
 </body>
+
 </html>

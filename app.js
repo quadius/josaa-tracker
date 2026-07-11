@@ -11,8 +11,15 @@
  *   - Cache the (category, gender)-filtered subset of records so matchAllRounds()
  *     does the filter once per recalc, not once per preference.
  *   - Debounced localStorage save (was: serialize full prefs on every keystroke).
+ *
+ * PERF FIX (v3.2):
+ *   - Incremental table updates. Previously every rank/allotment keystroke did
+ *     `tableBody.innerHTML = html` for ALL rows (200 prefs × 8 cols = 1600 cells
+ *     of DOM teardown + rebuild + layout + paint). Now rank/allotment changes
+ *     only touch the gap cell and row class for rows that actually changed —
+ *     no innerHTML rebuild. Full rebuild still happens for search/filter/cat/gender.
  */
-console.log('[JoSAA] app.js v3.1 loaded');
+console.log('[JoSAA] app.js v3.2 loaded');
 
 // Application State
 const state = {
@@ -37,6 +44,13 @@ let knownInstitutesCache = null;
 // Invalidated when category/gender change OR when round data is reloaded.
 let matchIndexCache = null;
 let matchIndexKey = null;
+
+// PERF: cache of rendered table rows for incremental updates.
+// Keyed by choiceNo. Value: { tr, gapCell, currentRowClass, currentGapHtml }.
+// Populated by renderTable() after innerHTML set. Used by updateTableIncremental()
+// to avoid full innerHTML rebuild on rank/allotment changes.
+// Invalidated (cleared) whenever renderTable() runs a full rebuild.
+let renderedRowCache = new Map();
 
 // UI Elements
 const els = {
@@ -834,12 +848,45 @@ function showAdvisory(cls, badge, text) {
   els.advisoryDescription.textContent = text;
 }
 
+// ---- Gap HTML helper (extracted for reuse by incremental updates) ----
+function computeGapHtml(choice) {
+  let gapHtml = '<span class="gap none">—</span>';
+  const latestVal = choice.ranks[state.loadedRoundsCount];
+  if (latestVal && state.userRank) {
+    const cr = parseInt(latestVal.replace('P', ''), 10);
+    if (!isNaN(cr)) {
+      const diff = cr - state.userRank;
+      if (diff >= 0) {
+        gapHtml = `<span class="gap pos">+${diff}</span>`;
+      } else {
+        const absDiff = Math.abs(diff);
+        const margin = cr * 0.15;
+        if (absDiff <= Math.max(150, margin)) {
+          gapHtml = `<span class="gap close">-${absDiff}</span>`;
+        } else {
+          gapHtml = `<span class="gap neg">-${absDiff}</span>`;
+        }
+      }
+    }
+  }
+  return gapHtml;
+}
+
+// Compute the row class for a choice based on current allotment.
+function computeRowClass(choice) {
+  if (!state.allottedChoiceNo) return '';
+  if (choice.choiceNo === state.allottedChoiceNo) return 'allotted-seat';
+  if (choice.choiceNo > state.allottedChoiceNo) return 'lower-preference';
+  return '';
+}
+
 // ---- Table Rendering ----
 function renderTable() {
   const query = (els.tableSearch.value || '').trim().toLowerCase();
   const filter = els.matchStatusFilter.value;
 
   if (state.preferenceOrder.length === 0) {
+    renderedRowCache.clear();
     els.tableThead.innerHTML = `<tr>
       <th class="text-center" width="55">#</th>
       <th>Institute Name</th>
@@ -878,17 +925,15 @@ function renderTable() {
   els.tableSummaryText.textContent = `${list.length} of ${state.preferenceOrder.length} choices shown`;
 
   if (list.length === 0) {
+    renderedRowCache.clear();
     els.tableBody.innerHTML = `<tr><td colspan="${3 + state.loadedRoundsCount + 1}" class="empty-state">No matching preferences found.</td></tr>`;
     return;
   }
 
   let html = '';
   for (const c of list) {
-    let rowClass = '';
-    if (state.allottedChoiceNo) {
-      if (c.choiceNo === state.allottedChoiceNo) rowClass = 'allotted-seat';
-      else if (c.choiceNo > state.allottedChoiceNo) rowClass = 'lower-preference';
-    }
+    const rowClass = computeRowClass(c);
+    const gapHtml = computeGapHtml(c);
 
     // Render round cells
     let roundCells = '';
@@ -899,28 +944,7 @@ function renderTable() {
         : `<td class="text-center" style="color:var(--text-muted)">—</td>`;
     }
 
-    // Calculate gap for latest round
-    let gapHtml = '<span class="gap none">—</span>';
-    const latestVal = c.ranks[state.loadedRoundsCount];
-    if (latestVal && state.userRank) {
-      const cr = parseInt(latestVal.replace('P', ''), 10);
-      if (!isNaN(cr)) {
-        const diff = cr - state.userRank;
-        if (diff >= 0) {
-          gapHtml = `<span class="gap pos">+${diff}</span>`;
-        } else {
-          const absDiff = Math.abs(diff);
-          const margin = cr * 0.15;
-          if (absDiff <= Math.max(150, margin)) {
-            gapHtml = `<span class="gap close">-${absDiff}</span>`;
-          } else {
-            gapHtml = `<span class="gap neg">-${absDiff}</span>`;
-          }
-        }
-      }
-    }
-
-    html += `<tr class="${rowClass}">
+    html += `<tr class="${rowClass}" data-choice-no="${c.choiceNo}">
       <td class="text-center" style="font-weight:700">${c.choiceNo}</td>
       <td>${c.institute}</td>
       <td>${c.program}</td>
@@ -930,6 +954,62 @@ function renderTable() {
   }
 
   els.tableBody.innerHTML = html;
+
+  // PERF: rebuild the row cache so incremental updates can run without a
+  // full innerHTML rebuild. We query the DOM once here and store references
+  // to each row's <tr> and its last <td> (the gap cell).
+  renderedRowCache.clear();
+  const rows = els.tableBody.querySelectorAll('tr[data-choice-no]');
+  for (let i = 0; i < rows.length; i++) {
+    const tr = rows[i];
+    const choiceNo = parseInt(tr.getAttribute('data-choice-no'), 10);
+    const cells = tr.children;
+    const gapCell = cells[cells.length - 1]; // last cell is always gap
+    renderedRowCache.set(choiceNo, {
+      tr,
+      gapCell,
+      currentRowClass: tr.className,
+      currentGapHtml: gapCell.innerHTML
+    });
+  }
+}
+
+// PERF: incremental table update — only touches gap cells and row classes
+// that actually changed. Avoids the full innerHTML rebuild that was the
+// remaining bottleneck on rank/allotment keystrokes (200 rows × 8 cols =
+// 1600 cells of DOM teardown + layout + paint per keystroke).
+//
+// Precondition: renderTable() must have been called at least once since the
+// last full state change (preference load / category / gender / search / filter).
+// If the cache is empty (e.g. table is showing empty state), this is a no-op.
+function updateTableIncremental() {
+  if (renderedRowCache.size === 0) {
+    // No rows cached — fall back to full render. This happens when the table
+    // is showing the empty state or "No matching preferences found".
+    renderTable();
+    return;
+  }
+
+  for (const [choiceNo, cache] of renderedRowCache) {
+    const choice = state.preferenceOrder.find(c => c.choiceNo === choiceNo);
+    // If the choice is no longer in the preference list (e.g. user re-loaded
+    // prefs), skip — a full render will be triggered by the prefs change.
+    if (!choice) continue;
+
+    // Recompute row class
+    const newRowClass = computeRowClass(choice);
+    if (newRowClass !== cache.currentRowClass) {
+      cache.tr.className = newRowClass;
+      cache.currentRowClass = newRowClass;
+    }
+
+    // Recompute gap HTML
+    const newGapHtml = computeGapHtml(choice);
+    if (newGapHtml !== cache.currentGapHtml) {
+      cache.gapCell.innerHTML = newGapHtml;
+      cache.currentGapHtml = newGapHtml;
+    }
+  }
 }
 
 // ---- Render-path split (PERF) ----
@@ -942,10 +1022,11 @@ function recalculateAndRender() {
 }
 
 // Light path: only rank or allotment changed -> matching is unaffected,
-// just re-render advisory + table.
+// just re-render advisory + incrementally update table (gap cells + row classes).
+// No full innerHTML rebuild — this is the key win for large preference lists.
 function renderAdvisoryAndTable() {
   updateAdvisory();
-  renderTable();
+  updateTableIncremental();
 }
 
 // ---- State Management ----
